@@ -81,10 +81,23 @@ pub struct ProxyTestResult {
     pub error: Option<String>,
 }
 
+/// 测试代理可达性所用的目标
+///
+/// 判定口径是「能收到任何 HTTP 响应就算通」——4xx/5xx 同样证明
+/// TCP + TLS + 代理整条链路工作正常。
+///
+/// 历史实现用的是 `httpbin.org` / `google.com` / `api.anthropic.com` 的 HEAD。
+/// 这三个目标在国内几乎必然超时，于是"测试通过/失败"与真实上游
+/// （如 `api.openai.com`）完全对不上：代理明明不通，测试结果却不可信。
+const PROXY_TEST_TARGETS: &[&str] = &[
+    "https://api.openai.com/v1/models",
+    "https://www.cloudflare.com/cdn-cgi/trace",
+];
+
 /// 测试代理连接
 ///
 /// 通过指定的代理 URL 发送测试请求，返回连接结果和延迟。
-/// 使用多个测试目标，任一成功即认为代理可用。
+/// 任一目标能拿到 HTTP 响应即认为代理可用。
 #[tauri::command]
 pub async fn test_proxy_url(url: String) -> Result<ProxyTestResult, String> {
     if url.trim().is_empty() {
@@ -103,18 +116,11 @@ pub async fn test_proxy_url(url: String) -> Result<ProxyTestResult, String> {
         .build()
         .map_err(|e| format!("Failed to build client: {e}"))?;
 
-    // 使用多个测试目标，提高兼容性
-    // 优先使用 httpbin（专门用于 HTTP 测试），回退到其他公共端点
-    let test_urls = [
-        "https://httpbin.org/get",
-        "https://www.google.com",
-        "https://api.anthropic.com",
-    ];
+    let mut failures: Vec<String> = Vec::new();
 
-    let mut last_error = None;
-
-    for test_url in test_urls {
-        match client.head(test_url).send().await {
+    for test_url in PROXY_TEST_TARGETS {
+        // 用 GET 而不是 HEAD：HEAD 在不少 CDN 上行为不一致（405/501 属于代理没坏）
+        match client.get(*test_url).send().await {
             Ok(resp) => {
                 let latency = start.elapsed().as_millis() as u64;
                 log::debug!(
@@ -131,17 +137,22 @@ pub async fn test_proxy_url(url: String) -> Result<ProxyTestResult, String> {
                 });
             }
             Err(e) => {
-                log::debug!("[GlobalProxy] Test to {test_url} failed: {e}");
-                last_error = Some(e);
+                // 保留真实传输层原因，否则用户只会看到 "error sending request"
+                let reason = http_client::describe_transport_error(&e);
+                log::debug!("[GlobalProxy] Test to {test_url} failed: {reason}");
+                failures.push(format!("{test_url} -> {reason}"));
             }
         }
     }
 
-    // 所有测试目标都失败
+    // 所有测试目标都失败：把每个目标的原因都带回去，区分
+    // 「代理端口没人监听」与「代理能连但出网被封」
     let latency = start.elapsed().as_millis() as u64;
-    let error_msg = last_error
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "All test targets failed".to_string());
+    let error_msg = if failures.is_empty() {
+        "All test targets failed".to_string()
+    } else {
+        failures.join("; ")
+    };
 
     log::debug!(
         "[GlobalProxy] Test failed: {} -> {} ({}ms)",
@@ -244,4 +255,67 @@ pub async fn scan_local_proxies() -> Vec<DetectedProxy> {
     })
     .await
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 取一个当场可证明"没人监听"的 loopback 代理地址
+    ///
+    /// 不能靠"释放一个本机端口"来制造死端口：临时端口区间（49152–65535）
+    /// 同时是本机出站连接的源端口，本机 socket churn 密集，刚释放的端口
+    /// 随时被占掉，`connect()` 会意外成功。特权端口 1/7/9 需要 root 才能
+    /// bind，普通测试进程永远抢不走，再当场复核一次确实被拒绝。
+    fn dead_proxy() -> String {
+        use std::net::ToSocketAddrs;
+        for port in [1u16, 7, 9] {
+            let url = format!("http://127.0.0.1:{port}");
+            if std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}")
+                    .to_socket_addrs()
+                    .expect("loopback 必须能解析")
+                    .next()
+                    .expect("loopback 必须有地址"),
+                std::time::Duration::from_millis(600),
+            )
+            .is_err()
+            {
+                return url;
+            }
+        }
+        panic!("特权端口 1/7/9 都没被拒绝：本机有服务在监听，夹具前提不成立");
+    }
+
+    #[test]
+    fn proxy_test_targets_exclude_domains_unreachable_in_cn() {
+        // 历史实现用 httpbin.org / google.com：国内几乎必然超时，
+        // 于是「测试通过」与真实上游（api.openai.com）完全对不上。
+        assert!(!PROXY_TEST_TARGETS.is_empty(), "至少要有一个测试目标");
+        for banned in ["httpbin.org", "google.com"] {
+            assert!(
+                !PROXY_TEST_TARGETS
+                    .iter()
+                    .any(|t| t.contains(banned)),
+                "测试目标里不该再有国内不通的 {banned}: {PROXY_TEST_TARGETS:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_url_reports_actionable_cause_when_proxy_is_dead() {
+        let dead = dead_proxy();
+        let result = test_proxy_url(dead.clone())
+            .await
+            .expect("命令应返回 success=false，而不是 Err");
+
+        assert!(!result.success, "代理没人监听时绝不能报成功");
+
+        let err = result.error.expect("失败必须带原因");
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("refused") || lower.contains("connect"),
+            "失败原因必须可行动（能看出是连不上代理），实际: {err}"
+        );
+    }
 }

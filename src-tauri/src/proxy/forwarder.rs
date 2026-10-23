@@ -3594,12 +3594,16 @@ fn should_force_identity_encoding(
 }
 
 fn map_reqwest_send_error(error: reqwest::Error) -> ProxyError {
+    // 只取 `without_url()` 会把所有失败压成同一句 "error sending request"，
+    // 分不清「代理端口没人监听」「DNS 解析不了」「TLS 握手失败」。把 source chain
+    // 里的真实原因带出来，502 才能自证是哪一层坏了。
+    let detail = super::http_client::describe_transport_error(&error);
     if error.is_timeout() {
-        ProxyError::Timeout(format!("上游请求超时: {}", error.without_url()))
+        ProxyError::Timeout(format!("上游请求超时: {detail}"))
     } else if error.is_connect() {
-        ProxyError::ForwardFailed(format!("上游连接失败: {}", error.without_url()))
+        ProxyError::ForwardFailed(format!("上游连接失败: {detail}"))
     } else {
-        ProxyError::ForwardFailed(format!("上游请求发送失败: {}", error.without_url()))
+        ProxyError::ForwardFailed(format!("上游请求发送失败: {detail}"))
     }
 }
 

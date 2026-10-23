@@ -109,6 +109,47 @@ macro_rules! env_locked {
     };
 }
 
+/// 全 crate 共享的「监听端口」锁守卫。
+///
+/// ## 它挡的是什么
+///
+/// 测试要断言"某个代理端口通/不通"，就得真的占一个端口。两类占用方式里，
+/// **持有型**（bind 之后一直不 drop，直到断言跑完）是安全的，但需要互斥：
+/// `proxy::http_client::live_listener` 与 `commands::global_proxy` 都从固定
+/// 区间顺序扫描，两个并发测试会挑到**同一个**端口。模块内私有的 mutex
+/// 挡不住跨模块串扰（与本文件开头 env 锁的教训同源），所以这把锁是 crate 级的。
+///
+/// ## 它**挡不住**什么（这一点同样重要）
+///
+/// 占用型（bind → 测 → drop，再断言"这个端口没人监听"）**不在这把锁的能力范围内**：
+/// macOS 的临时端口区间是 49152–65535（`sysctl net.inet.ip.portrange`），
+/// 它同时是本机**出站连接的源端口**。本机 socket churn 密集，一条新建的
+/// 出站连接就可能占住刚释放的端口，于是"没人监听"这个前提在进程外被推翻——
+/// 加多少锁都没用。实测该断言 8 次里红 5 次。
+///
+/// ⇒ **这类夹具应当改用特权端口（1/7/9，需要 root 才能 bind）**，
+/// 而不是靠"释放一个本机端口"来制造死端口。见
+/// `proxy::http_client::tests::dead_endpoint` 与
+/// `commands::global_proxy::tests::dead_proxy`。
+///
+/// ## 用法
+///
+/// ```ignore
+/// let _churn = test_support::port_churn_guard();
+/// ```
+///
+/// 不要在一个测试里重复获取（与 `EnvGuard` 不同，这里**不是可重入的**，
+/// 重复获取会死锁），也不要在持有期间 `.await`（clippy 会报
+/// `await_holding_lock`，且 tokio current-thread runtime 上会阻塞别的线程）。
+/// 一次持有到 scope 结束即可。
+pub fn port_churn_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        // 中毒自愈：持有线程 panic 不应该让后续所有端口测试永久卡死。
+        .unwrap_or_else(|err| err.into_inner())
+}
+
 /// 把含敏感凭据的配置内容打码后再用于断言，避免 panic 信息把 API key 打进
 /// CI 日志。具体规则：把任意形如 `"<key>": "<value>"` 或 `<key>: '<value>'`（json5）
 /// 的 value 替换成 `"<REDACTED len=N>"`，长度仍保留便于 debug 大小变化。
