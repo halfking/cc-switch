@@ -5,7 +5,11 @@
 
 ## TL;DR
 
-API Key 字段直接写 `$MY_ENV_VAR` 或 `$MY_ENV_VAR` 占位符，cc-switch 在切档前会从进程环境里读出来并展开；落盘字段里只剩空字符串（如果你想完全没值）或加密值（沿用既有落盘逻辑）。
+API Key 字段直接写 `$MY_ENV_VAR` 或 `${MY_ENV_VAR}` 占位符，**kaixuan bundle 的「安装/重装」流程**会从进程环境里读出来并展开；落盘字段里写的是**展开后的真实 key**，明文存在 settings.db 的 `settings_config` JSON 里（**没有静态加密**）——`$NAME` 字面量不会留在库里。
+
+⚠️ 两点边界，别把话说满：
+- **只有 kaixuan bundle 的「安装/重装」会展开**。普通的「添加供应商 / 切换供应商」不做 env 展开（`src-tauri/src/commands/provider.rs` 的 `add_provider` 直接落库）。
+- **落盘是真值明文**。`settings_config` 在 SQLite 里是 `TEXT`（`src-tauri/src/database/schema.rs`），库侧没有任何加密实现 ⇒ 展开后的 key 会以明文形式留在 settings.db 里。
 
 ```text
 # ~/.zshenv
@@ -33,7 +37,7 @@ cc-switch 启动 → 用户点「安装/重装」→ 后端把 `$KAIXUAN_KXPMS_K
 
 ## 行为契约
 
-1. **空字符串** → 当「未填」，落盘字段为空。前端会在 bundle install 完成后用红色 banner 标出「缺失 env」。
+1. **空字符串** → 当「未填」，落盘字段为空。前端会在 bundle install 完成后用**琥珀色** banner 标出「缺失 env」（红色 banner 是「安装失败」用的）。
 2. **占位符 + env 已定义且非空** → 展开成真实值后再写库。原始 `$NAME` 不留。
 3. **占位符 + env 缺失或为空** → 落盘为空字符串；后端返回 `missingEnvVars: [...]`，UI 提示用户。
 4. **混合**（如 `prefix-${A}-suffix`）→ 各自独立展开，缺失的子项变空。
@@ -88,7 +92,7 @@ Environment="KAIXUAN_LOCAL_KEY=sk-local-yyyyyyyy"
 
 ## 安全约束
 
-1. **不要把 `$NAME` 写进 Git**。`.env*` 已经在 `.gitignore`，但 bundle install 流程里 `$NAME` 本身会进 settings.db 的 settings_config JSON——如果开了「导出全配置到 dotfiles 仓库」等同步功能，记得把 settings.db 加入 ignore。
+1. **不要把 `$NAME` 写进 Git**。`.env*` 已经在 `.gitignore`，但 bundle install 流程里**展开后的真实 key** 会进 settings.db 的 settings_config JSON（明文，无静态加密）——如果开了「导出全配置到 dotfiles 仓库」等同步功能，记得把 settings.db 加入 ignore。
 2. **不要 echo 展开后的真值**。`echo $KAIXUAN_KXPMS_KEY` 会写到 shell history；改用 `echo ${KEY:0:6}...`。
 3. **占位符是字符串匹配，不是表达式**。`$((1+1))`、`${VAR:-default}` 都不展开——保持简单可审计。
 4. **多用户系统上慎用 `launchctl setenv`**。同一 GUI 域内所有应用都能读到；非个人机器请用 Keychain。

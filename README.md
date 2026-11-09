@@ -348,7 +348,7 @@ For detailed guides on every feature, check out the **[User Manual](docs/user-ma
 - **Auto-failover** — Configure a failover queue for each tool; when a request fails, CC Switch automatically moves on to the next provider in the queue, backed by a circuit breaker and provider health monitoring
 - **Rectifier** — Automatically fixes certain requests that some upstreams can't handle (e.g. Thinking signatures, or falling back when images aren't supported)
 - Official providers (e.g. Claude Official) can't go through local routing (except Codex's OpenAI Official)
-- Guides: [Using GPT in Claude Code](docs/guides/claude-codex-routing-guide-en.md) · [Using Claude in Codex](docs/guides/codex-claude-routing-guide-en.md)
+- Guides: [Using GPT in Claude Code](docs/guides/claude-codex-routing-guide-en.md) · [Using Claude in Codex](docs/guides/codex-claude-routing-guide-en.md) · [kaixuan Bundle One-Click Setup](docs/guides/kaixuan-bundle-en.md) · [kaixuan Bundle 一键接入（zh）](docs/guides/kaixuan-bundle-zh.md) · [Env-var secrets in cc-switch（zh）](docs/guides/cc-switch-env-vars-zh.md)
 
 ### MCP, Prompts & Skills
 
